@@ -132,3 +132,89 @@ Quiero que me respondan con sus propias palabras:
 ## 6. Para Cerrar
 
 No quiero medir si son capaces de escribir JWT de memoria. Quiero ver si son capaces de usar IA de forma crítica y responsable en un contexto de seguridad, donde los errores tienen consecuencias reales. Usen la IA, pero verifiquen, cuestionen y entiendan todo lo que les entregue.
+
+---
+
+# Documentación de la implementación
+
+## Cómo levantar el proyecto con Docker
+
+Requisitos: Docker y Docker Compose instalados.
+
+1. Clonar el repositorio y ubicarse en la raíz del proyecto.
+2. Crear un archivo `.env` en la raíz (no se versiona, por seguridad) con las siguientes variables:
+
+   ```
+   POSTGRES_DB=restaurante
+   POSTGRES_USER=restaurante
+   POSTGRES_PASSWORD=<una contraseña propia>
+
+   JWT_SECRET=<una cadena aleatoria de al menos 32 caracteres>
+   JWT_ACCESS_EXPIRATION_MS=900000
+   JWT_REFRESH_EXPIRATION_MS=604800000
+   ```
+
+3. Levantar la API junto con la base de datos:
+
+   ```bash
+   docker-compose up
+   ```
+
+   Esto construye la imagen de la API (`Dockerfile`, build multi-stage, corre como usuario no root),
+   levanta un contenedor de PostgreSQL 16 y ejecuta las migraciones de Flyway automáticamente al
+   iniciar la API. No hace falta crear tablas a mano.
+
+4. La API queda disponible en `http://localhost:8080`.
+
+Para correr el proyecto sin Docker (`./gradlew bootRun`) hace falta una instancia propia de
+PostgreSQL y exportar las mismas variables (`DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `JWT_SECRET`,
+etc.) apuntando a ella. Los tests (`./gradlew test`) no necesitan ninguna base de datos real: usan
+H2 en memoria.
+
+## Arquitectura (N-Capas)
+
+El proyecto sigue una arquitectura de N-Capas dentro del paquete `com.uca.pncparcialfinalrestaurante`:
+
+- **Presentación (`controller`)**: expone los endpoints REST, valida las solicitudes entrantes
+  (`@Valid` sobre los DTOs de `dto/request`) y delega toda la lógica de negocio a la capa de
+  servicios. No accede directamente a los repositorios.
+- **Lógica de negocio (`service`)**: contiene las reglas de negocio, incluida la autorización por
+  atributo (sucursal) que exige la regla no trivial del parcial. Traduce entre entidades y los DTOs
+  de respuesta (`dto/response`).
+- **Acceso a datos (`repository` + `entities`)**: interfaces `JpaRepository` sobre las entidades
+  JPA. El esquema de base de datos se versiona con migraciones de Flyway
+  (`src/main/resources/db/migration`), no con generación automática de Hibernate.
+- **Seguridad (`security` + `configuration`)**: emisión y validación de JWT (`JwtUtil`,
+  `JwtAuthFilter`), configuración del filtro de seguridad (`SecurityConfiguration`) y autorización
+  por rol a nivel de método (`@PreAuthorize`).
+- **Manejo de errores (`exception`)**: excepciones de negocio propias y un `GlobalExceptionHandler`
+  centralizado que las traduce a respuestas HTTP consistentes (`ApiError`), incluyendo los
+  rechazos que ocurren directamente en el filtro de seguridad.
+
+## Roles y regla de negocio
+
+### Roles
+
+| Rol | Permisos |
+|---|---|
+| `ADMINISTRADOR` | Acceso total: gestiona sucursales, mesas, productos, usuarios y pedidos de todas las sucursales. |
+| `ENCARGADO_TURNO` | Gestiona mesas y pedidos, pero únicamente de la sucursal a la que pertenece. |
+| `CLIENTE` | Solo puede crear, ver y cancelar sus propios pedidos. |
+
+### Regla de negocio no trivial: autorización por atributo (Opción B)
+
+Un `ENCARGADO_TURNO` no puede gestionar mesas o pedidos de una sucursal distinta a la suya, aunque
+tenga el rol correcto — esto no se puede resolver solo con `@PreAuthorize("hasRole(...)")`, porque
+el rol por sí solo no sabe a qué sucursal pertenece cada mesa o pedido.
+
+**Mecanismo:** cada access token incluye el `sucursalId` del usuario autenticado como claim (ver
+`JwtUtil`). En cada request, `JwtAuthFilter` reconstruye esa información a partir del token, sin
+volver a consultar la base de datos, y la expone a los controladores mediante `CustomUserDetails` /
+`AuthenticatedUser`. La capa de servicio (`MesaService`, `PedidoService`) compara explícitamente el
+`sucursalId` del usuario autenticado contra el `sucursalId` de la mesa (o de la mesa asociada al
+pedido) antes de permitir la operación; si no coinciden, lanza `ForbiddenSucursalException`, que el
+`GlobalExceptionHandler` traduce a un `403 Forbidden`.
+
+Un `CLIENTE` tiene una verificación de propiedad análoga (solo puede ver/cancelar sus propios
+pedidos), implementada con la excepción estándar de Spring Security `AccessDeniedException` para
+diferenciarla explícitamente de la regla de sucursal.
